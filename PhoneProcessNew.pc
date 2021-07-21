@@ -1,0 +1,971 @@
+/*****************************************************
+ * 프로그램ID	: PhoneProcessNew.c
+ * 프로그램명	: 핸드폰 데이타를 처리한다
+ * 작성일		: 2018/09/01
+ * 작성자		: 김성철
+ *****************************************************/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <signal.h>
+#include <errno.h>
+
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/epoll.h>
+#include <sys/ioctl.h>
+#include <sys/time.h>
+#include <time.h>
+
+#include <profile.h>
+#include <ft_common.h>
+#include <ora_common.h>
+#include <wds_common.h>
+
+#include "PhoneProcessNew.h"
+
+/*************************************************************************************
+ * 구현 시작..
+ *************************************************************************************/
+
+int main(int argc, char** argv)
+{
+	FILE *fp;
+	char readbuf[MAX_BUFFER];
+	uInt readnum = 0, finish_line;
+	
+	time_t curtime, chktime;
+	
+	PHONE_DATA pdata;
+	
+	SetProgramName(argv[0]);
+	
+	/* 서버를 초기화 한다. */
+	InitServer();
+	
+	/* 로우 파일을 연다 */
+	while ( 1 )
+	{
+		if ( (fp = fopen(raw_file_name, "r")) == NULL )
+		{
+			Log("main: 파일 여는 도중 에러가 발생하였습니다. file_name[%s] errno[%d]\n", raw_file_name, errno);
+			sleep(30);
+			continue;
+		}
+		break;
+	}
+	
+	/* 처리한 라인넘버를 가져온다 */
+	finish_line = GetDataReadNum(_PROC_PHONE_PROCESS_NEW_, 0);
+	time(&chktime);
+	
+	/* 데이타를 읽어 처리한다 */
+	while ( 1 )
+    {
+    	/* 파일을 읽어온다. */
+		memset(readbuf, 0x00, MAX_BUFFER);
+		if ( fgets(readbuf, MAX_BUFFER, fp) != NULL )
+		{
+			readnum++;
+						
+			/* 처리한 데이타는 건너뛴다 */
+			if ( readnum <= finish_line ) continue;
+			
+			/* 수신데이타를 파싱한다 */
+			if ( ParsePhoneData(readbuf, &pdata) == -1 )
+			{
+				Log("main: 수신 데이타 파싱 오류! [%s]\n", readbuf);
+				continue;
+			}
+			
+			/* 기압은 모조건 통과 */
+			pdata.QC_PRE = QC_ERROR_OK;
+			
+			/* 제보QC를 한다 */
+			if ( QC_WeatherStatus(WEATHER_STATUS_1ST, &pdata) == -1 )
+			{
+				Log("main: 기상제보 QC 에러! [%s]\n", readbuf);
+				continue;
+			}
+			
+			/* 제보QC를 한다(날씨앱용) */
+			if ( QC_WeatherStatusNOW(WEATHER_STATUS_1ST, &pdata) == -1 )
+			{
+				Log("main: 기상제보(NOW) QC 에러! [%s]\n", readbuf);
+				continue;
+			}
+			
+			/* 데이타를 DB에 삽입힌다. */
+			if ( InsertPhoneData(&pdata) == -1 )
+			{
+				Log("main: 데이타 DB 삽입 에러! [%s]\n", readbuf);
+				continue;
+			}
+			
+			/* 처리된 라인넘버를 기록한다 */
+			WriteLineReadNum(readnum, _PROC_PHONE_PROCESS_NEW_, 0, "phone");
+		}
+		else
+		{
+			time(&curtime);
+			
+			if ( ( curtime % 60 == 0 && curtime > chktime )|| curtime - chktime > 60 )
+			{
+				ProcessWeatherStatus2nd(curtime - (long)GRID_TIME);
+				chktime = curtime;
+			}
+			else
+				usleep(10000);
+		}
+	}
+	
+	interrupt(0);
+	exit(EXIT_SUCCESS);
+}
+
+/**
+ * 읽어드린 데이타를 파싱한다
+ */ 
+int ParsePhoneData(char* buff, PHONE_DATA* pdata)
+{
+	int ptr, len;
+	char token[64];
+	
+	/* 버퍼를 조정한다 */
+	len = strlen(buff);
+	if ( buff[len-1] == '\n' ) buff[len-1] = 0;
+	
+	/* 메모리초기화 */
+	memset(pdata, 0x00, sizeof(PHONE_DATA));
+	
+	/* 날짜 및 시간을 파싱한다 */
+	if ( buff[0] != '[' || buff[9] != ' ' || buff[16] != ']' || buff[16] == ' ' )
+	{
+		Log("ParseMWSData: 시간 세팅 에러!\n");
+		return (-1);
+	}
+	else
+	{
+		/* 자료시간 */
+		memcpy(token, buff+1, 8); token[8] = 0;
+		pdata->data_date = atoi(token);
+		
+		memcpy(token, buff+10, 6); token[6] = 0;
+		pdata->data_time = atoi(token);
+	}
+	ptr = 18;
+	
+	/* 데이타를 파싱한다 */
+	PARSE_DATA(user_num, "사용자고유번호", atoi)
+	PARSE_STRING(ip, "IP")
+	PARSE_DATA(lng, "경도", atof)
+	PARSE_DATA(lat, "위도", atof)
+	PARSE_DATA(PRE, "기압", atof)
+	PARSE_CHAR(w_status, "제보")
+	PARSE_CHAR(w_group, "제보그룹")
+	
+	return (0);
+}
+
+/**
+ * 날씨제보 2차 QC를 실행한다
+ */
+int	ProcessWeatherStatus2nd(time_t ftime)
+{
+	char sql[MAX_BUFFER];
+	
+	int count = 0;
+	PHONE_DATA pdata;
+	
+	/* 오라클사용 등록 */
+	struct sqlca sqlca;
+	EXEC SQL CONTEXT USE :ctx;
+		
+	/* 대상 데이타를 가져온다 */
+	sprintf(sql, "SELECT DATA_DATE, DATE_IDX, DATA_TIME, LONGITUDE, LATITUDE, W_STATUS, W_GROUP, QC_W "
+				 "FROM OBSERV_PHONE "
+				 "WHERE QC_W in ('S', 'A', 'a') "
+				 "  and ROUND((UPDATE_TIME-TO_DATE('19700101','YYYYMMDD'))*86400-32400) <= %ld ", (long)ftime);	
+	//Log("[%ld][%d]\n", (long)ftime, intTimeFrom(ftime));
+	/* 쿼리를 실행한다 */
+	EXEC SQL PREPARE _FETCH_PHONE_DATA_S FROM :sql;
+	EXEC SQL DECLARE _FETCH_PHONE_DATA CURSOR FOR _FETCH_PHONE_DATA_S;
+	
+	EXEC SQL OPEN _FETCH_PHONE_DATA;
+	if ( _SQLOK )
+	{
+		while ( 1 )
+		{
+			memset(&pdata, 0x00, sizeof(PHONE_DATA));
+			
+			EXEC SQL FETCH _FETCH_PHONE_DATA INTO :pdata.data_date,
+												  :pdata.date_idx,
+												  :pdata.data_time,
+												  :pdata.lng,
+												  :pdata.lat,
+												  :pdata.w_status,
+												  :pdata.w_group,
+												  :pdata.f_QC_W;
+			if ( _SQLNOTFOUND ) break;
+				
+			Log("ProcessWeatherStatus2nd: Fetch Data data_time[%d:%d] latlng[%lf:%lf] w_status[%c:%c] QC[%c]\n", pdata.data_date, pdata.data_time, pdata.lat, pdata.lng, pdata.w_status, pdata.w_group, pdata.f_QC_W);
+			
+			/* 기존 처리단계에서 Again판정이었다면, QC를 재실행한다 */
+			if ( pdata.f_QC_W == 'A' )
+			{
+				if ( QC_WeatherStatus(WEATHER_STATUS_2ND, &pdata) == -1 )
+				{
+					Log("ProcessWeatherStatus2nd: 기상제보 QC 에러!\n");
+					count = 0;
+					break;
+				}
+			}
+			else if ( pdata.f_QC_W == 'a' )
+			{
+				if ( QC_WeatherStatus(WEATHER_STATUS_2ND_EXTRA, &pdata) == -1 )
+				{
+					Log("ProcessWeatherStatus2nd: 기상제보 추가 QC 에러!\n");
+					count = 0;
+					break;
+				}
+			}
+			else
+				pdata.QC_W = QC_ERROR_OK;
+			
+			/* 데이타를 갱신힌다. */
+			if ( UpdatePhoneData(&pdata) == -1 )
+			{
+				Log("ProcessWeatherStatus2nd: 데이타 갱신 에러!\n");
+				count = 0;
+				break;;
+			}
+			
+			count++;
+		}
+	}
+	else
+	{
+ 		Log("ProcessWeatherStatus2nd: 대상데이타 조회중 에러! sqlcode[%d]\n", sqlca.sqlcode);
+ 		return (-1);
+	}
+	EXEC SQL CLOSE _FETCH_PHONE_DATA;
+	
+	if ( count > 0 )
+	{
+		EXEC SQL COMMIT;
+	}
+	else
+	{
+		EXEC SQL ROLLBACK;
+	}
+	
+	return (0);
+}
+
+/*************************************************************************************
+ * 날씨제보 QC 처리 함수
+ *************************************************************************************/
+ 
+/**
+ * 날씨제보의 QC를 진행한다
+ */
+int QC_WeatherStatus(char step, PHONE_DATA* pdata)
+{
+	char sql[MAX_BUFFER];
+	
+	struct tm tm;
+	time_t timep;
+	char stime[32];
+	
+	double base_x, base_y;
+	time_t base_time;
+	
+	char fv;
+	FDATA fdata[MAX_WEATHER_STATUS];
+	int i, fcount, tcount, ptr;
+	
+	/* 오라클사용 등록 */
+	struct sqlca sqlca;
+	EXEC SQL CONTEXT USE :ctx;
+		
+	/* 시간을 UNIX Timestamp로 변환한다 */
+	sprintf(stime, "%08d%06d", pdata->data_date, pdata->data_time);
+	strptime(stime, "%Y%m%d%H%M%S", &tm);
+	timep = mktime(&tm);
+	
+	/* 기준격자를 계산한다 */
+	if ( step == WEATHER_STATUS_2ND_EXTRA )
+	{
+		base_x = pdata->lat - ((double)((int)(pdata->lat * 1000000) % (int)(GRID_X_EXTRA * 1000000)) / 1000000.0);
+		base_y = pdata->lng - ((double)((int)(pdata->lng * 1000000) % (int)(GRID_Y_EXTRA * 1000000)) / 1000000.0);
+	}
+	else
+	{
+		base_x = pdata->lat - ((double)((int)(pdata->lat * 1000000) % (int)(GRID_X * 1000000)) / 1000000.0);
+		base_y = pdata->lng - ((double)((int)(pdata->lng * 1000000) % (int)(GRID_Y * 1000000)) / 1000000.0);
+	}
+	
+	/* 기준시간을 계산한다 */
+	if ( step == WEATHER_STATUS_1ST )
+	{
+		base_time = (long)timep - (long)(GRID_TIME);
+	}
+	else
+	{
+		base_time = (long)timep + (long)(GRID_TIME);
+	}
+	
+	/* 조건에 만족하는 데이타를 가져온다 */
+	if ( step == WEATHER_STATUS_2ND_EXTRA )
+	{
+		sprintf(sql, "SELECT NVL(W_GROUP, ' ') "
+					 "FROM OBSERV_PHONE "
+					 "WHERE LONGITUDE between %lf and %lf "
+					 "  and LATITUDE between %lf and %lf ", 
+				 	 base_y, base_y + GRID_Y_EXTRA, base_x, base_x + GRID_X_EXTRA
+		);
+	}
+	else
+	{
+		sprintf(sql, "SELECT NVL(W_GROUP, ' ') "
+					 "FROM OBSERV_PHONE "
+					 "WHERE LONGITUDE between %lf and %lf "
+					 "  and LATITUDE between %lf and %lf ", 
+				 	 base_y, base_y + GRID_Y, base_x, base_x + GRID_X
+		);
+	}
+	if ( step == WEATHER_STATUS_1ST )
+	{
+		ptr = strlen(sql);
+		sprintf(&sql[ptr], "  and ROUND((UPDATE_TIME-TO_DATE('19700101','YYYYMMDD'))*86400-32400) between %ld and %ld ", (long)base_time, (long)timep);
+	}
+	else
+	{
+		ptr = strlen(sql);
+		sprintf(&sql[ptr], "  and ROUND((UPDATE_TIME-TO_DATE('19700101','YYYYMMDD'))*86400-32400) between %ld and %ld ", (long)timep, (long)base_time);
+	}
+	
+	/* 쿼리를 실행한다 */
+	EXEC SQL PREPARE _WEATHER_STATUS_S FROM :sql;
+	EXEC SQL DECLARE _WEATHER_STATUS CURSOR FOR _WEATHER_STATUS_S;
+	
+	EXEC SQL OPEN _WEATHER_STATUS;
+	if ( _SQLOK )
+	{
+		tcount = fcount = 0;
+		memset(fdata, 0x00, sizeof(FDATA)*MAX_WEATHER_STATUS);
+		
+		/* 본인데이타를 추가한다 */
+		fdata[fcount].status = pdata->w_group;
+		fdata[fcount].count++;
+		fcount++;
+		tcount++;
+		
+		while ( 1 )
+		{
+			EXEC SQL FETCH _WEATHER_STATUS INTO :fv;
+			if ( _SQLNOTFOUND ) break;
+			
+			if ( fv == ' ' ) continue;
+ 			
+ 			for ( i = 0 ; i < fcount ; i++ )
+ 			{
+ 				if ( fdata[i].status == fv )
+ 				{
+ 					fdata[i].count++;
+ 					break;
+ 				}
+ 			}
+ 			if ( i >= fcount )
+ 			{
+ 				fdata[fcount].status = fv;
+ 				fdata[fcount].count = 1;
+ 				fcount++;
+ 			}
+ 			
+ 			tcount++;
+		}
+	}
+	else
+	{
+		sprintf(pdata->QC_W_ERR, "격자 자료를 가져오는 도중 에러가 발생하였습니다");
+ 		Log("QC_WeatherStatus: %s sqlcode[%d]\n", pdata->QC_W_ERR, sqlca.sqlcode);
+ 		return (-1);
+	}
+	EXEC SQL CLOSE _WEATHER_STATUS;
+	
+	/* 기본은 Fail 이다 */
+	pdata->QC_W = QC_ERROR_COMMON;
+	sprintf(pdata->QC_W_ERR, "STEP[%c] TOTAL[%d] FCOUNT[%d] data[%c]", step, tcount, fcount, pdata->w_group);
+	
+	/* QC여부를 판단한다 */
+	if ( tcount > 4 )
+	{
+		double my_rate = 0.0;
+		
+		/* 내가 제보한 그룹의 제보율을 가져온다 */
+		for ( i = 0 ; i < fcount ; i++ )
+		{
+			if ( fdata[i].status == pdata->w_group )
+			{
+				my_rate = (double)fdata[i].count / (double)tcount;
+				break;
+			}
+		}
+		
+		if ( my_rate >= 0.38 )
+		{
+			pdata->QC_W = QC_ERROR_OK;
+		}
+		else
+		{
+			ptr = strlen(pdata->QC_W_ERR);
+			sprintf(&pdata->QC_W_ERR[ptr], " my_rate[%.2lf]", my_rate*100);
+		}
+	}
+	else if ( tcount == 4 )
+	{
+		if ( fcount == 1 )
+		{
+			pdata->QC_W = QC_ERROR_OK;
+		}
+		else if ( fcount == 2 )
+		{
+			/* 데이타를 정렬한다 */
+			qsort(fdata, fcount, sizeof(FDATA), _qsort_wstatus);
+			
+			if ( fdata[0].count == 2 )
+			{
+				pdata->QC_W = QC_ERROR_OK;
+			}
+			
+			if ( fdata[0].count == 3 && fdata[0].status == pdata->w_group )
+			{
+				pdata->QC_W = QC_ERROR_OK;
+			}
+			
+			if ( pdata->QC_W != QC_ERROR_OK )
+			{
+				ptr = strlen(pdata->QC_W_ERR);
+				sprintf(&pdata->QC_W_ERR[ptr], " s1[%c:%d] s2[%c:%d]", fdata[0].status, fdata[0].count, fdata[1].status, fdata[1].count);
+			}
+		}
+	}
+	else if ( tcount == 3 )
+	{
+		if ( fcount == 1 )
+		{
+			pdata->QC_W = QC_ERROR_OK;
+		}
+		else if ( fcount == 2 )
+		{
+			/* 데이타를 정렬한다 */
+			qsort(fdata, fcount, sizeof(FDATA), _qsort_wstatus);
+			
+			if ( fdata[0].count == 2 && fdata[0].status == pdata->w_group )
+			{
+				pdata->QC_W = QC_ERROR_OK;
+			}
+			
+			if ( pdata->QC_W != QC_ERROR_OK )
+			{
+				ptr = strlen(pdata->QC_W_ERR);
+				sprintf(&pdata->QC_W_ERR[ptr], " s1[%c:%d] s2[%c:%d]", fdata[0].status, fdata[0].count, fdata[1].status, fdata[1].count);
+			}
+		}
+		else
+		{
+			if ( step == WEATHER_STATUS_1ST )
+			{
+				pdata->QC_W = QC_ERROR_SPEC;
+			}
+		}
+	}
+	else
+	{
+		if ( step == WEATHER_STATUS_1ST )
+		{
+			pdata->QC_W = QC_ERROR_SPEC;
+		}
+		else
+		{
+			pdata->QC_W = QC_ERROR_OK;
+		}
+	}
+	
+	return (0);
+}
+
+/**
+ * 날씨제보의 QC를 진행한다 (날씨앱용)
+ */
+int QC_WeatherStatusNOW(char step, PHONE_DATA* pdata)
+{
+	char sql[MAX_BUFFER];
+	
+	struct tm tm; time_t timep; char stime[32];
+	double base_x, base_y;
+	time_t base_time;
+	
+	char fv;
+	FDATA fdata[MAX_WEATHER_STATUS];
+	int i, fcount, tcount, ptr;
+	
+	/* 오라클사용 등록 */
+	struct sqlca sqlca;
+	EXEC SQL CONTEXT USE :ctx;
+		
+	/* 시간을 UNIX Timestamp로 변환한다 */
+	sprintf(stime, "%08d%06d", pdata->data_date, pdata->data_time);
+	strptime(stime, "%Y%m%d%H%M%S", &tm);
+	timep = mktime(&tm);
+	
+	/* 기준격자를 계산한다 */
+	if ( step == WEATHER_STATUS_2ND_EXTRA )
+	{
+		base_x = pdata->lat - ((double)((int)(pdata->lat * 1000000) % (int)(GRID_X_EXTRA * 1000000)) / 1000000.0);
+		base_y = pdata->lng - ((double)((int)(pdata->lng * 1000000) % (int)(GRID_Y_EXTRA * 1000000)) / 1000000.0);
+	}
+	else
+	{
+		base_x = pdata->lat - ((double)((int)(pdata->lat * 1000000) % (int)(GRID_X * 1000000)) / 1000000.0);
+		base_y = pdata->lng - ((double)((int)(pdata->lng * 1000000) % (int)(GRID_Y * 1000000)) / 1000000.0);
+	}
+	
+	/* 기준시간을 계산한다 */
+	base_time = (long)timep - (long)(GRID_TIME);
+	
+	/* 조건에 만족하는 데이타를 가져온다 */
+	if ( step == WEATHER_STATUS_2ND_EXTRA )
+	{
+		sprintf(sql, "SELECT NVL(W_GROUP, ' ') "
+					 "FROM OBSERV_PHONE "
+					 "WHERE LONGITUDE between %lf and %lf "
+					 "  and LATITUDE between %lf and %lf "
+					 "  and ROUND((UPDATE_TIME-TO_DATE('19700101','YYYYMMDD'))*86400-32400) between %ld and %ld ",
+				 	 base_y, base_y + GRID_Y_EXTRA, base_x, base_x + GRID_X_EXTRA, (long)base_time, (long)timep
+		);
+	}
+	else
+	{
+		sprintf(sql, "SELECT NVL(W_GROUP, ' ') "
+					 "FROM OBSERV_PHONE "
+					 "WHERE LONGITUDE between %lf and %lf "
+					 "  and LATITUDE between %lf and %lf "
+					 "  and ROUND((UPDATE_TIME-TO_DATE('19700101','YYYYMMDD'))*86400-32400) between %ld and %ld ",
+				 	 base_y, base_y + GRID_Y, base_x, base_x + GRID_X, (long)base_time, (long)timep
+		);
+	}
+	
+	/* 쿼리를 실행한다 */
+	EXEC SQL PREPARE _WEATHER_STATUS_NOW_S FROM :sql;
+	EXEC SQL DECLARE _WEATHER_STATUS_NOW CURSOR FOR _WEATHER_STATUS_NOW_S;
+	
+	EXEC SQL OPEN _WEATHER_STATUS_NOW;
+	if ( _SQLOK )
+	{
+		tcount = fcount = 0;
+		memset(fdata, 0x00, sizeof(FDATA)*MAX_WEATHER_STATUS);
+		
+		/* 본인데이타를 추가한다 */
+		fdata[fcount].status = pdata->w_group;
+		fdata[fcount].count++;
+		fcount++;
+		tcount++;
+		
+		while ( 1 )
+		{
+			EXEC SQL FETCH _WEATHER_STATUS_NOW INTO :fv;
+			if ( _SQLNOTFOUND ) break;
+			
+			if ( fv == ' ' ) continue;
+ 			
+ 			for ( i = 0 ; i < fcount ; i++ )
+ 			{
+ 				if ( fdata[i].status == fv )
+ 				{
+ 					fdata[i].count++;
+ 					break;
+ 				}
+ 			}
+ 			if ( i >= fcount )
+ 			{
+ 				fdata[fcount].status = fv;
+ 				fdata[fcount].count = 1;
+ 				fcount++;
+ 			}
+ 			
+ 			tcount++;
+		}
+	}
+	else
+	{
+		sprintf(pdata->QC_NOW_ERR, "격자 자료를 가져오는 도중 에러가 발생하였습니다");
+ 		Log("QC_WeatherStatusNOW: %s sqlcode[%d]\n", pdata->QC_NOW_ERR, sqlca.sqlcode);
+ 		return (-1);
+	}
+	EXEC SQL CLOSE _WEATHER_STATUS_NOW;
+	
+	/* 기본은 Fail 이다 */
+	pdata->QC_NOW = QC_ERROR_COMMON;
+	sprintf(pdata->QC_NOW_ERR, "STEP[%c] TOTAL[%d] FCOUNT[%d] data[%c]", step, tcount, fcount, pdata->w_group);
+	
+	/* QC여부를 판단한다 */
+	if ( tcount > 4 )
+	{
+		double my_rate = 0.0;
+		
+		/* 내가 제보한 그룹의 제보율을 가져온다 */
+		for ( i = 0 ; i < fcount ; i++ )
+		{
+			if ( fdata[i].status == pdata->w_group )
+			{
+				my_rate = (double)fdata[i].count / (double)tcount;
+				break;
+			}
+		}
+		
+		if ( my_rate >= 0.38 )
+		{
+			pdata->QC_NOW = QC_ERROR_OK;
+		}
+		else
+		{
+			ptr = strlen(pdata->QC_NOW_ERR);
+			sprintf(&pdata->QC_NOW_ERR[ptr], " my_rate[%.2lf]", my_rate*100);
+		}
+	}
+	else if ( tcount == 4 )
+	{
+		if ( fcount == 1 )
+		{
+			pdata->QC_NOW = QC_ERROR_OK;
+		}
+		else if ( fcount == 2 )
+		{
+			/* 데이타를 정렬한다 */
+			qsort(fdata, fcount, sizeof(FDATA), _qsort_wstatus);
+			
+			if ( fdata[0].count == 2 )
+			{
+				pdata->QC_NOW = QC_ERROR_OK;
+			}
+			
+			if ( fdata[0].count == 3 && fdata[0].status == pdata->w_group )
+			{
+				pdata->QC_NOW = QC_ERROR_OK;
+			}
+			
+			if ( pdata->QC_NOW != QC_ERROR_OK )
+			{
+				ptr = strlen(pdata->QC_NOW_ERR);
+				sprintf(&pdata->QC_NOW_ERR[ptr], " s1[%c:%d] s2[%c:%d]", fdata[0].status, fdata[0].count, fdata[1].status, fdata[1].count);
+			}
+		}
+	}
+	else if ( tcount == 3 )
+	{
+		if ( fcount == 1 )
+		{
+			pdata->QC_NOW = QC_ERROR_OK;
+		}
+		else if ( fcount == 2 )
+		{
+			/* 데이타를 정렬한다 */
+			qsort(fdata, fcount, sizeof(FDATA), _qsort_wstatus);
+			
+			if ( fdata[0].count == 2 && fdata[0].status == pdata->w_group )
+			{
+				pdata->QC_NOW = QC_ERROR_OK;
+			}
+			
+			if ( pdata->QC_NOW != QC_ERROR_OK )
+			{
+				ptr = strlen(pdata->QC_NOW_ERR);
+				sprintf(&pdata->QC_NOW_ERR[ptr], " s1[%c:%d] s2[%c:%d]", fdata[0].status, fdata[0].count, fdata[1].status, fdata[1].count);
+			}
+		}
+	}
+	else if ( tcount == 2 )
+	{
+		if ( fcount == 1 )
+		{
+			pdata->QC_NOW = QC_ERROR_OK;
+		}
+	}
+	else
+	{
+		if ( step == WEATHER_STATUS_1ST )
+		{
+			QC_WeatherStatusNOW(WEATHER_STATUS_2ND_EXTRA, pdata);
+		}
+	}
+	
+	return (0);
+}
+
+int _qsort_wstatus(const void *a, const void *b)
+{
+	return ((FDATA*)b)->count - ((FDATA*)a)->count;
+}
+
+/*************************************************************************************
+ * DB 처리 함수
+ *************************************************************************************/
+ 
+/**
+ * 처리한 데이타를 DB에 삽입한다
+ */
+int	InsertPhoneData(PHONE_DATA* pdata)
+{
+	char sql[MAX_BUFFER], QC_W;
+	int date_idx = 1;
+	
+	/* 오라클사용 등록 */
+	struct sqlca sqlca;
+	EXEC SQL CONTEXT USE :ctx;
+	
+	/* DATE_IDX를 가져온다 */
+	EXEC SQL
+		SELECT NVL(MAX(DATE_IDX), 0) + 1 INTO :date_idx
+		FROM OBSERV_PHONE WHERE DATA_DATE = :pdata->data_date;
+	
+	if ( _SQLNOTOK )
+	{
+		Log("InsertPhoneData: DataIdx를 가져오는 도중 에러가 발생하였습니다 sqlcode[%d]\n", sqlca.sqlcode);
+ 		return (-1);
+	}
+	
+	if ( pdata->QC_W == QC_ERROR_OK )		 QC_W = 'S';
+	else if ( pdata->QC_W == QC_ERROR_SPEC ) QC_W = 'a';
+	else									 QC_W = 'A';
+ 	
+ 	/* 데이타를 저장한다 */
+ 	sprintf(sql, "INSERT INTO OBSERV_PHONE "
+ 				 "( "
+ 				 "	DATA_DATE, DATE_IDX, "
+ 				 "	USER_NUM, DATA_TIME, LONGITUDE, LATITUDE, "
+ 				 "	PRE, W_STATUS, W_GROUP, QC_PRE, QC_W, QC_NOW, "
+ 				 "	IP_ADDR, UPDATE_TIME "
+ 				 ") "
+ 				 "VALUES "
+ 				 "( "
+ 				 "	'%d', '%d', "
+ 				 "	'%d', '%d', '%lf', '%lf', "
+ 				 "	'%lf', '%c', '%c', '%c', '%c', '%c', "
+ 				 "	'%s', sysdate "
+ 				 ") ",
+ 				 pdata->data_date, date_idx, 
+ 				 pdata->user_num, pdata->data_time, pdata->lng, pdata->lat, 
+ 				 pdata->PRE, pdata->w_status, pdata->w_group, (pdata->QC_PRE==QC_ERROR_OK)?('Y'):('N'), QC_W, (pdata->QC_NOW==QC_ERROR_OK)?('Y'):('N'),
+ 				 pdata->ip
+ 	);
+ 	EXEC SQL EXECUTE IMMEDIATE :sql;
+ 		
+ 	if ( _SQLNOTOK )
+ 	{
+ 		Log("InsertPhoneData: 데이타를 삽입하는 도중 에러가 발생하였습니다 sqlcode[%d]\n", sqlca.sqlcode);
+ 		EXEC SQL ROLLBACK;
+ 		return (-1);
+ 	}
+ 	
+ 	/* QC에러를 기록한다 */
+ 	if ( pdata->QC_PRE != QC_ERROR_OK ) InsertQCError(pdata->data_date, date_idx, QC_TYPE_PRE, pdata->QC_PRE_ERR);
+	if ( pdata->QC_W != QC_ERROR_OK )   InsertQCError(pdata->data_date, date_idx, QC_TYPE_W, pdata->QC_W_ERR);
+	if ( pdata->QC_NOW != QC_ERROR_OK ) InsertQCError(pdata->data_date, date_idx, QC_TYPE_NOW, pdata->QC_NOW_ERR);
+	
+	/* 카운터 정보를 갱신한다. */
+	if ( UpdatePhoneCount(pdata) == -1 )
+	{
+ 		EXEC SQL ROLLBACK;
+ 		return (-1);
+	}
+			
+	EXEC SQL COMMIT;
+	return (0);
+}
+
+/**
+ * 처리한 데이타를 갱신한다
+ */
+int	UpdatePhoneData(PHONE_DATA* pdata)
+{
+	char sql[MAX_BUFFER];
+	
+	/* 오라클사용 등록 */
+	struct sqlca sqlca;
+	EXEC SQL CONTEXT USE :ctx;
+	
+ 	/* 데이타를 갱신한다 */
+ 	sprintf(sql, "UPDATE OBSERV_PHONE SET QC_W = '%c' WHERE DATA_DATE = %d and DATE_IDX = %d", (pdata->QC_W==QC_ERROR_OK)?('Y'):('N'), pdata->data_date, pdata->date_idx);
+ 	EXEC SQL EXECUTE IMMEDIATE :sql;
+ 		
+ 	if ( _SQLNOTOK )
+ 	{
+ 		Log("UpdatePhoneData: 데이타를 갱신하는 도중 에러가 발생하였습니다 sqlcode[%d]\n", sqlca.sqlcode);
+ 		return (-1);
+ 	}
+ 	Log("UpdatePhoneData: QC_W[%c => %c]\n", pdata->f_QC_W, (pdata->QC_W==QC_ERROR_OK)?('Y'):('N'));
+ 	
+ 	/* QC에러를 기록한다 */
+	if ( pdata->QC_W != QC_ERROR_OK ) InsertQCError(pdata->data_date, pdata->date_idx, QC_TYPE_W, pdata->QC_W_ERR);
+	
+	return (0);
+}
+
+/**
+ * QC 에러를 기록한다
+ */
+int	InsertQCError(int data_date, int date_idx, char qc_type, char* msg)
+{
+	int idx;
+	
+	/* 오라클사용 등록 */
+	struct sqlca sqlca;
+	EXEC SQL CONTEXT USE :ctx;
+	
+	/* 일련번호를 가져온다 */
+	EXEC SQL
+		SELECT SEQ_QC_ERROR.nextval INTO :idx FROM DUAL;
+		
+	/* 에러메세지를 기록한다 */
+	EXEC SQL
+		INSERT INTO QC_ERROR
+		(
+			IDX, QC_TYPE, QC_ERRMSG, DATA_DATE, DATE_IDX, UPDATE_TIME
+		)
+		VALUES
+		(
+			:idx, :qc_type, :msg, :data_date, :date_idx, sysdate
+		);
+	
+	if ( _SQLNOTOK )
+ 	{
+ 		Log("InsertQCError: QC 에러를 기록하는 도중 에러가 발생하였습니다 sqlcode[%d]\n", sqlca.sqlcode);
+ 		return (-1);
+ 	}
+ 	
+ 	return (0);
+}
+
+/**
+ * 카운터정보를 갱신한다
+ */
+int UpdatePhoneCount(PHONE_DATA* pdata)
+{
+	int count = 0;
+	
+	/* 오라클사용 등록 */
+	struct sqlca sqlca;
+	EXEC SQL CONTEXT USE :ctx;
+		
+	/* 당일 등록된 갯수를 가져온다 */
+	EXEC SQL
+		SELECT count(DATE_IDX) INTO :count FROM OBSERV_PHONE WHERE USER_NUM = :pdata->user_num and DATA_DATE = :pdata->data_date;
+	
+	if ( _SQLNOTOK )
+ 	{
+ 		Log("UpdatePhoneCount: 카운터 정보를 가져오는 도중 에러가 발생하였습니다 sqlcode[%d]\n", sqlca.sqlcode);
+ 		return (-1);
+ 	}
+ 	
+ 	/* 카운터 정보를 갱신한다 */
+ 	EXEC SQL
+ 		UPDATE OBSERV_PHONE_COUNT SET COUNT = :count, UPDATE_TIME = sysdate
+ 		WHERE DATA_DATE = :pdata->data_date and USER_NUM = :pdata->user_num;
+ 	
+ 	if ( _SQLNOTOK )
+ 	{
+ 		if ( _SQLNOTFOUND )
+ 		{
+ 			EXEC SQL
+ 				INSERT INTO OBSERV_PHONE_COUNT (DATA_DATE, USER_NUM, COUNT, UPDATE_TIME) VALUES (:pdata->data_date, :pdata->user_num, :count, sysdate);
+ 			
+ 			if ( _SQLNOTOK )
+ 			{
+	 			Log("UpdatePhoneCount: 카운터 정보를 삽입 도중 에러가 발생하였습니다 sqlcode[%d]\n", sqlca.sqlcode);
+		 		return (-1);
+		 	}
+ 		}
+ 		else
+	 	{
+			Log("UpdatePhoneCount: 카운터 정보를 갱신 도중 에러가 발생하였습니다 sqlcode[%d]\n", sqlca.sqlcode);
+			return (-1);
+	 	}
+ 	}
+			
+	return (0);
+}
+
+/*************************************************************************************
+ * 초기화 함수
+ *************************************************************************************/
+
+/**
+ * 서버를 초기화한다.
+ */ 
+void InitServer()
+{
+	char db_user[30], conf_file_name[256], raw_name[32];
+	struct sqlca sqlca;
+	
+	/* 공유메모리를 초기화 한다. */
+	InitCommonMemory();
+	
+	/* 설정파일을 연다. */
+	sprintf(conf_file_name, "%s/%s/%s", mdb->program_home, CONF_PATH, SERVER_CONFIG_FILE);
+	if ( !OpenProfile(conf_file_name) )
+	{
+		Log("InitServer: 설정파일을 여는 도중 에러가 발생하였습니다. file[%s] errno[%d]\n", conf_file_name, errno);
+		exit(EXIT_FAILURE);
+	}
+	
+	GetProfileString("PHONE", "raw_name", raw_name);
+	sprintf(raw_file_name, "%s/%s/%s.%d.raw", mdb->program_home, DATA_PATH, raw_name, intDate());
+	
+	/* 설정파일을 닫는다. */
+	CloseProfile();
+	
+ 	/* DB에 접속한다. */
+	strcpy(db_user, ORALCE_OBSR_USER);
+	EXEC SQL CONTEXT ALLOCATE :ctx;
+	EXEC SQL CONTEXT USE :ctx;
+	EXEC SQL CONNECT :db_user;
+ 	
+    /* Process를 등록한다. */
+	if ( (process_id = RegistProcess(_PROC_PHONE_PROCESS_NEW_)) == -1 )
+	{
+		Log("InitServer: 프로세스 등록에 실패하였습니다.\n");
+		exit(EXIT_FAILURE);
+	}
+	
+	/* 시스널 핸들러 설정 */
+	signal(SIGHUP, SIG_IGN);
+	signal(SIGPIPE, SIG_IGN);
+	signal(SIGINT, interrupt);
+    signal(SIGTERM, interrupt);
+    signal(SIGQUIT, interrupt);
+    
+	Log("InitServer: 서버 초기화! Process Start PID[%d]..................................\n", process_id);
+}
+
+/**
+ * 서버를 종료한다.
+ */
+void interrupt(int sig)
+{
+	struct sqlca sqlca;
+	
+	/* DB연결을 종료한다. */
+	EXEC SQL CONTEXT USE :ctx;
+	EXEC SQL COMMIT WORK RELEASE;
+	EXEC SQL CONTEXT FREE :ctx;
+	
+	/* 프로세스 등록 해제 */
+	RemoveProcess(_PROC_PHONE_PROCESS_NEW_);
+	DeAttachShm((void*)mdb);
+	
+    exit(EXIT_SUCCESS);
+}
